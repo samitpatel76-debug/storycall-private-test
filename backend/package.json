@@ -1,0 +1,12 @@
+{
+  "name": "storycall-v2-realtime-webrtc",
+  "version": "2.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
