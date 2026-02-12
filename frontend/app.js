@@ -165,14 +165,38 @@ async function startCall(){
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
-  const sdpResp = await fetch("/session", {
-    method: "POST",
-    headers: { "Content-Type": "application/sdp" },
-    body: offer.sdp
-  });
+ // 1) Ask server for ephemeral token
+const tokenResp = await fetch("/token");
+const tokenData = await tokenResp.json();
 
-  const answerSdp = await sdpResp.text();
-  await pc.setRemoteDescription({ type:"answer", sdp: answerSdp });
+if (!tokenResp.ok) {
+  throw new Error("Token error: " + JSON.stringify(tokenData));
+}
+
+// Depending on API shape, this is commonly tokenData.client_secret.value
+const EPHEMERAL_KEY =
+  tokenData?.client_secret?.value ||
+  tokenData?.client_secret ||
+  tokenData?.ephemeral_key ||
+  tokenData?.value;
+
+if (!EPHEMERAL_KEY) {
+  throw new Error("No ephemeral key in response: " + JSON.stringify(tokenData));
+}
+
+// 2) Send SDP offer directly to OpenAI with ephemeral key
+const sdpResp = await fetch("https://api.openai.com/v1/realtime", {
+  method: "POST",
+  headers: {
+    "Authorization": `Bearer ${EPHEMERAL_KEY}`,
+    "Content-Type": "application/sdp"
+  },
+  body: offer.sdp
+});
+
+const answerSdp = await sdpResp.text();
+await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+
 }
 
 /** Parse server events for text deltas + lifecycle. */
