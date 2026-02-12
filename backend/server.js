@@ -29,12 +29,12 @@ app.use("/", express.static(path.join(__dirname, "../frontend")));
  * - sends multipart form to https://api.openai.com/v1/realtime/calls (Authorization: Bearer <server key>)
  * - returns answer SDP text
  */
-async function fetchWithRetry(url, options, retries = 3) {
+async function fetchWithRetry(url, options, retries = 6) {
   let lastErr = null;
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000); // 30 seconds
+    const timeout = setTimeout(() => controller.abort(), 90000); // 30 seconds
 
     try {
       const resp = await fetch(url, { ...options, signal: controller.signal });
@@ -51,7 +51,7 @@ async function fetchWithRetry(url, options, retries = 3) {
       clearTimeout(timeout);
       lastErr = e;
       if (attempt < retries) {
-        await new Promise(r => setTimeout(r, 800 * attempt));
+        await new Promise(r => setTimeout(r, 1500 * attempt));
         continue;
       }
     }
