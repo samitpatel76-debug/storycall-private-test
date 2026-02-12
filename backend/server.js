@@ -6,139 +6,92 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-
-// Browser posts raw SDP
-app.use(express.text({ type: ["application/sdp", "text/plain"], limit: "2mb" }));
+app.use(express.json({ limit: "1mb" }));
 
 const PORT = process.env.PORT || 8792;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const MODEL = process.env.OPENAI_REALTIME_MODEL || "gpt-realtime";
-const VOICE = process.env.OPENAI_REALTIME_VOICE || "marin";
 
-if (!OPENAI_API_KEY) {
-  console.warn("WARNING: OPENAI_API_KEY is not set. /session will fail.");
-}
-
-// Serve frontend
 app.use("/", express.static(path.join(__dirname, "../frontend")));
 
-/**
- * POST /session
- * Unified interface from the Realtime WebRTC guide:
- * - receives SDP from browser
- * - sends multipart form to https://api.openai.com/v1/realtime/calls (Authorization: Bearer <server key>)
- * - returns answer SDP text
- */
-async function fetchWithRetry(url, options, retries = 6) {
-  let lastErr = null;
-
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 90000); // 30 seconds
-
-    try {
-      const resp = await fetch(url, { ...options, signal: controller.signal });
-      clearTimeout(timeout);
-
-      // Retry on transient gateway issues
-      if ([502, 503, 504].includes(resp.status) && attempt < retries) {
-        await new Promise(r => setTimeout(r, 800 * attempt));
-        continue;
-      }
-
-      return resp;
-    } catch (e) {
-      clearTimeout(timeout);
-      lastErr = e;
-      if (attempt < retries) {
-        await new Promise(r => setTimeout(r, 1500 * attempt));
-        continue;
-      }
-    }
-  }
-
-  throw lastErr || new Error("fetchWithRetry failed");
+function santaSystemPrompt() {
+  return [
+    "You are Santa Claus on a phone call with a child age 4 to 6.",
+    "No emojis. Short, clear sentences. Warm, jolly, natural. Use 'Ho ho ho' sometimes.",
+    "Always react realistically to the child’s last message (especially feelings).",
+    "Offer two choices: STORY or GAME.",
+    "STORY: ask for hero, place, magic thing, and a problem. Then tell a 5–10 minute story (900–1500 words) in 8–12 short paragraphs, with 1–2 tiny choices.",
+    "GAME: Santa’s Helper Mission for ages 4–6: simple choices (A/B), helpful clues, repeat options, celebrate effort.",
+    "Safety: G-rated. Don’t ask for personal info."
+  ].join("\n");
 }
-app.get("/token", async (req, res) => {
-  try {
-    if (!OPENAI_API_KEY) {
-      res.status(500).json({ error: "OPENAI_API_KEY missing" });
-      return;
-    }
 
-    // Create a short-lived realtime session token (ephemeral)
-    const r = await fetch("https://api.openai.com/v1/realtime/sessions", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        voice: VOICE
-      })
-    });
-
-    const data = await r.json();
-
-    if (!r.ok) {
-      res.status(r.status).json({ error: data });
-      return;
-    }
-
-    // Send the ephemeral client secret back to the browser
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: String(err?.stack || err) });
-  }
-});
-
-app.post("/session", async (req, res) => {
+// SSE streaming endpoint
+app.post("/api/stream", async (req, res) => {
   try {
     if (!OPENAI_API_KEY) {
       res.status(500).send("OPENAI_API_KEY missing");
       return;
     }
-    const sdpOffer = req.body;
-    if (!sdpOffer || typeof sdpOffer !== "string") {
-      res.status(400).send("Missing SDP offer");
-      return;
-    }
 
-    const session = {
-      type: "realtime",
-      model: MODEL,
-      // You can also lock to audio-only if you want: output_modalities: ["audio"]
-      output_modalities: ["audio", "text"],
-      audio: {
-        output: { voice: VOICE }
-      }
+    const userText = (req.body?.text || "").toString().slice(0, 2000);
+    const modeHint = (req.body?.mode || "").toString().slice(0, 20);
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+
+    const body = {
+      model: "gpt-4.1-mini",
+      input: [
+        { role: "system", content: santaSystemPrompt() },
+        {
+          role: "user",
+          content:
+            (modeHint ? `Mode hint: ${modeHint}\n` : "") +
+            `Child says: ${userText}`
+        }
+      ],
+      stream: true
     };
 
-    const fd = new FormData();
-    fd.set("sdp", sdpOffer);
-    fd.set("session", JSON.stringify(session));
-
-    const r = await fetchWithRetry("https://api.openai.com/v1/realtime/calls", {
+    const r = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: fd
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
     });
 
-    if (!r.ok) {
-      const txt = await r.text();
-      res.status(500).send(txt.slice(0, 5000));
+    if (!r.ok || !r.body) {
+      const txt = await r.text().catch(() => "");
+      res.write(`event: error\ndata: ${JSON.stringify({ status: r.status, body: txt.slice(0, 2000) })}\n\n`);
+      res.end();
       return;
     }
 
-    const answerSdp = await r.text();
-    res.setHeader("Content-Type", "application/sdp");
-    res.send(answerSdp);
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      const chunk = decoder.decode(value, { stream: true });
+
+      // Forward raw SSE chunks from OpenAI to browser as data events
+      // We’ll extract text client-side.
+      res.write(`event: chunk\ndata: ${JSON.stringify({ chunk })}\n\n`);
+    }
+
+    res.write(`event: done\ndata: {}\n\n`);
+    res.end();
   } catch (err) {
     res.status(500).send(String(err?.stack || err));
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`StoryCall v2 server on http://localhost:${PORT}`);
+  console.log(`StoryCall streaming server on http://localhost:${PORT}`);
 });
+
