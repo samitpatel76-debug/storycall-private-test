@@ -13,6 +13,44 @@ let micStream = null;
 let selfStream = null;
 let remoteAudio = null;
 
+function bindDataChannel(channel) {
+  dc = channel;
+  console.log("Data channel bound:", dc.label);
+
+  dc.onopen = () => {
+    console.log("Data channel open:", dc.label);
+
+    // 1) Create a user message
+    dc.send(JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "Hi Santa! Please say hello to me out loud." }]
+      }
+    }));
+
+    // 2) Ask for an AUDIO response
+    dc.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["audio"],
+        instructions:
+          "You are Santa on a real phone call with a child age 4–6. No emojis. Short warm sentences. Start with a jolly 'Ho ho ho!', ask their first name, then ask how they feel today."
+      }
+    }));
+  };
+
+  dc.onmessage = (e) => {
+    try { console.log("Server event:", JSON.parse(e.data)); }
+    catch { console.log("Server event (raw):", e.data); }
+  };
+
+  dc.onclose = () => console.log("Data channel closed:", dc.label);
+  dc.onerror = (err) => console.log("Data channel error:", err);
+}
+
+
 let ptt = false;      // push-to-talk mode
 let connected = false;
 let santaSpeaking = false;
@@ -133,7 +171,15 @@ pc.ontrack = async (e) => {
   micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
 
   // Data channel for events
-  dc = pc.createDataChannel("oai-events");
+  // Handle server-created channel
+pc.ondatachannel = (event) => {
+  console.log("Got server datachannel:", event.channel.label);
+  bindDataChannel(event.channel);
+};
+
+// Also create a client channel (safe fallback)
+bindDataChannel(pc.createDataChannel("oai-events"));
+
 dc.onopen = () => {
   console.log("Data channel open");
 
