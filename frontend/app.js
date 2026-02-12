@@ -235,12 +235,15 @@ function handleServerEvent(raw){
     santaBubble.appendChild(tag);
   }
 
-  if(evt.type === "response.output_audio.started"){
-    setTalking(true);
-  }
-  if(evt.type === "response.output_audio.ended"){
-    setTalking(false);
-  }
+if (evt.type === "response.output_audio.started") {
+  console.log("Santa audio started");
+  setTalking(true);
+}
+if (evt.type === "response.output_audio.ended") {
+  console.log("Santa audio ended");
+  setTalking(false);
+}
+
 
   if(evt.type === "response.completed"){
     setTalking(false);
