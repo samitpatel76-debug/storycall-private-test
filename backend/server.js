@@ -29,6 +29,37 @@ app.use("/", express.static(path.join(__dirname, "../frontend")));
  * - sends multipart form to https://api.openai.com/v1/realtime/calls (Authorization: Bearer <server key>)
  * - returns answer SDP text
  */
+async function fetchWithRetry(url, options, retries = 3) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000); // 30 seconds
+
+    try {
+      const resp = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeout);
+
+      // Retry on transient gateway issues
+      if ([502, 503, 504].includes(resp.status) && attempt < retries) {
+        await new Promise(r => setTimeout(r, 800 * attempt));
+        continue;
+      }
+
+      return resp;
+    } catch (e) {
+      clearTimeout(timeout);
+      lastErr = e;
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 800 * attempt));
+        continue;
+      }
+    }
+  }
+
+  throw lastErr || new Error("fetchWithRetry failed");
+}
+
 app.post("/session", async (req, res) => {
   try {
     if (!OPENAI_API_KEY) {
@@ -55,7 +86,7 @@ app.post("/session", async (req, res) => {
     fd.set("sdp", sdpOffer);
     fd.set("session", JSON.stringify(session));
 
-    const r = await fetch("https://api.openai.com/v1/realtime/calls", {
+    const r = await fetchWithRetry("https://api.openai.com/v1/realtime/calls", {
       method: "POST",
       headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
       body: fd
