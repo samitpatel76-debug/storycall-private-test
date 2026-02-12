@@ -134,28 +134,35 @@ pc.ontrack = async (e) => {
 
   // Data channel for events
   dc = pc.createDataChannel("oai-events");
-  dc.onopen = ()=>{
-    connected = true;
-    ring("connect");
-    setStatus("Connected");
-    el("connPill").innerText = "WebRTC: Connected";
+dc.onopen = () => {
+  console.log("Data channel open");
 
-    // Update session: audio+text output, voice, VAD, instructions
-    sendEvent({
-      type: "session.update",
-      session: {
-        type: "realtime",
-        model: "gpt-realtime",
-        output_modalities: ["audio", "text"],
-        audio: {
-          input: {
-            turn_detection: { type: ptt ? "none" : "semantic_vad" }
-          },
-          output: { voice: "marin" }
-        },
-        instructions: santaInstructions()
-      }
-    });
+  // 1) Send a user message so the model has something to respond to
+  dc.send(JSON.stringify({
+    type: "conversation.item.create",
+    item: {
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "Hi Santa! Ho ho ho! Can you say hello to me?" }]
+    }
+  }));
+
+  // 2) Ask the model to respond in AUDIO
+  dc.send(JSON.stringify({
+    type: "response.create",
+    response: {
+      modalities: ["audio"],
+      instructions:
+        "You are Santa on a real phone call with a child age 4–6. No emojis. Short, warm sentences. Start with a jolly greeting, ask their name, then ask how they feel."
+    }
+  }));
+};
+
+dc.addEventListener("message", (e) => {
+  try { console.log("Server event:", JSON.parse(e.data)); }
+  catch { console.log("Server event (raw):", e.data); }
+});
+
 
     // Santa starts with a greeting immediately.
     sendEvent({
