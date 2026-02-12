@@ -109,11 +109,24 @@ async function startCall(){
 
   // Create peer connection
   pc = new RTCPeerConnection();
-  remoteAudio = document.createElement("audio");
-  remoteAudio.autoplay = true;
-  pc.ontrack = (e)=>{
-    remoteAudio.srcObject = e.streams[0];
-  };
+remoteAudio = document.createElement("audio");
+remoteAudio.autoplay = true;
+remoteAudio.muted = false;
+remoteAudio.playsInline = true;
+document.body.appendChild(remoteAudio);
+
+pc.ontrack = async (e) => {
+  console.log("ontrack fired, streams:", e.streams);
+  remoteAudio.srcObject = e.streams[0];
+  try {
+    await remoteAudio.play();
+    console.log("remoteAudio.play() OK");
+  } catch (err) {
+    console.log("remoteAudio.play() BLOCKED:", err);
+    // If blocked, click anywhere on the page once and it will usually allow playback.
+  }
+};
+
 
   // Mic
   micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
