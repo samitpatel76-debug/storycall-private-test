@@ -185,7 +185,7 @@ if (!EPHEMERAL_KEY) {
 }
 
 // 2) Send SDP offer directly to OpenAI with ephemeral key
-const sdpResp = await fetch("https://api.openai.com/v1/realtime", {
+const sdpResp = await fetch("https://api.openai.com/v1/realtime/calls", {
   method: "POST",
   headers: {
     "Authorization": `Bearer ${EPHEMERAL_KEY}`,
