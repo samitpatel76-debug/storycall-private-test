@@ -1,326 +1,382 @@
-// StoryCall v2 – Realtime WebRTC client
-// - WebRTC peer connection: mic audio to model, model audio back
-// - Data channel: send session.update + response.create + conversation events; receive transcript deltas
-// - “Push-to-talk” optional: disables VAD and uses manual response.create
-// - Camera preview is local-only (for FaceTime feel). No video is sent to the model.
+// StoryCall v2 – WebRTC client (robust)
+// Default: uses backend /session (server does SDP exchange with OpenAI)
+// Optional: can use /token + client-side SDP exchange by flipping USE_TOKEN = true
 
-const el = (id)=>document.getElementById(id);
+const USE_TOKEN = false; // set true only if your frontend is intended to use /token
+
+const el = (id) => document.getElementById(id);
 const logEl = el("log");
 
 let pc = null;
 let dc = null;
 let micStream = null;
-let selfStream = null;
 let remoteAudio = null;
 
-function bindDataChannel(channel) {
-  dc = channel;
-  console.log("Data channel bound:", dc.label);
-
-  dc.onopen = () => {
-    console.log("Data channel open:", dc.label);
-
-    // 1) Create a user message
-    dc.send(JSON.stringify({
-      type: "conversation.item.create",
-      item: {
-        type: "message",
-        role: "user",
-        content: [{ type: "input_text", text: "Hi Santa! Please say hello to me out loud." }]
-      }
-    }));
-
-    // 2) Ask for an AUDIO response
-    dc.send(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio"],
-        instructions:
-          "You are Santa on a real phone call with a child age 4–6. No emojis. Short warm sentences. Start with a jolly 'Ho ho ho!', ask their first name, then ask how they feel today."
-      }
-    }));
-  };
-
-  dc.onmessage = (e) => {
-    try { console.log("Server event:", JSON.parse(e.data)); }
-    catch { console.log("Server event (raw):", e.data); }
-  };
-
-  dc.onclose = () => console.log("Data channel closed:", dc.label);
-  dc.onerror = (err) => console.log("Data channel error:", err);
-}
-
-
-let ptt = false;      // push-to-talk mode
 let connected = false;
-let santaSpeaking = false;
+let didKickoff = false;
+let boundChannelLabels = new Set();
 
-function setTalking(talking){
-  santaSpeaking = talking;
-  el("santaSvg").classList.toggle("talk", !!talking);
+function setTalking(on) {
+  const mouth = el("santaSvg");
+  if (!mouth) return;
+  mouth.classList.toggle("talk", !!on);
+  mouth.classList.toggle("mouth", true);
 }
 
-function setStatus(text){
-  el("callStatus").innerText = text;
+function setStatus(text) {
+  const s = el("callStatus");
+  if (s) s.innerText = text;
 }
 
-function pushBubble(who, text){
+function setConnPill(text) {
+  const p = el("connPill");
+  if (p) p.innerText = text;
+}
+
+function pushBubble(who, text) {
+  if (!logEl) return null;
+
   const row = document.createElement("div");
   row.className = "row " + (who === "santa" ? "santa" : "kid");
+
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   bubble.innerText = text || "";
+
   const tag = document.createElement("div");
   tag.className = "tag";
   tag.innerText = who === "santa" ? "Santa" : "You";
   bubble.appendChild(tag);
+
   row.appendChild(bubble);
   logEl.appendChild(row);
   logEl.scrollTop = logEl.scrollHeight;
   return bubble;
 }
 
-function ring(type="connect"){
-  // Lightweight “call” sounds via Web Audio, no external files.
-  const ac = new (window.AudioContext || window.webkitAudioContext)();
-  const o = ac.createOscillator();
-  const g = ac.createGain();
-  o.connect(g); g.connect(ac.destination);
-  o.type = "sine";
-  const now = ac.currentTime;
-  const base = type === "ring" ? 440 : 660;
-  const dur = type === "ring" ? 0.18 : 0.12;
-  o.frequency.setValueAtTime(base, now);
-  g.gain.setValueAtTime(0.0001, now);
-  g.gain.exponentialRampToValueAtTime(0.18, now + 0.02);
-  g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-  o.start(now);
-  o.stop(now + dur + 0.01);
-  setTimeout(()=>ac.close(), 300);
+function ring(type = "connect") {
+  try {
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.connect(g);
+    g.connect(ac.destination);
+    o.type = "sine";
+    const now = ac.currentTime;
+    const base = type === "ring" ? 440 : 660;
+    const dur = type === "ring" ? 0.18 : 0.12;
+    o.frequency.setValueAtTime(base, now);
+    g.gain.setValueAtTime(0.0001, now);
+    g.gain.exponentialRampToValueAtTime(0.18, now + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    o.start(now);
+    o.stop(now + dur + 0.01);
+    setTimeout(() => ac.close(), 250);
+  } catch {}
 }
 
-function sendEvent(obj){
-  if(!dc || dc.readyState !== "open") return;
-  dc.send(JSON.stringify(obj));
-}
-
-/** Santa system instructions (kid 4–6, long story, helper game, realistic reactions, backchanneling). */
-function santaInstructions(){
+function santaInstructions() {
   return [
     "You are Santa Claus on a real-time phone/video call with a child (age 4 to 6).",
-    "Be warm, jolly, and natural. Use 'Ho ho ho' sometimes, not every sentence.",
-    "Speak in short, clear sentences. Use friendly pauses. Avoid long run-on lines.",
-    "Backchannel naturally while listening: 'Mm-hmm', 'Oh wow!', 'I hear you', but not too often.",
+    "Be warm, jolly, and natural. Use 'Ho ho ho' sometimes.",
+    "Speak in short, clear sentences.",
+    "Always respond realistically to the child’s last message (especially feelings).",
+    "No emojis.",
     "",
-    "Safety: Keep it G-rated and suitable for ages 4–6. No scary or adult content.",
-    "Do not ask for personal data (full name, address, school, phone). If shared, gently redirect.",
+    "Offer 2 simple choices: STORY or GAME.",
     "",
-    "Conversation realism:",
-    "- Always respond to what the child just said (feelings, answers, jokes).",
-    "- If you ask 'How are you feeling?', react appropriately to the answer before moving on.",
-    "- Offer 2–3 simple choices often. Repeat the choices if the child seems unsure.",
+    "STORY mode:",
+    "- Ask for: hero, place, magical thing, and a problem.",
+    "- Then tell a 5–10 minute story (900–1500 words).",
+    "- 8–12 short paragraphs (2–4 sentences each).",
+    "- Ask 1–2 tiny choices (A/B) and continue.",
     "",
-    "Modes:",
-    "If the child chooses STORY:",
-    "- Ask for quick prompts: hero, place, magical thing, problem.",
-    "- Then tell a 5–10 minute story (900–1500 words) based on those prompts.",
-    "- Break the story into 8–12 short paragraphs (2–4 sentences each).",
-    "- Make it collaborative: once or twice, ask a tiny choice (left/right, silly/brave ending).",
-    "- If the child answers, accept it and continue the story.",
+    "GAME mode:",
+    "- Santa's Helper Mission for ages 4–6.",
+    "- Give helpful clues, repeat options, celebrate effort.",
+    "- Keep choices A/B.",
     "",
-    "If the child chooses GAME:",
-    "- Play 'Santa's Helper Mission' for ages 4–6.",
-    "- Give strong clues and helpful guidance. Celebrate effort.",
-    "- Keep choices very simple (A/B/C) and read them out loud.",
-    "",
-    "You can speak and also provide a short text transcript. Do not use emojis."
+    "Safety:",
+    "- G-rated.",
+    "- Don’t ask for personal info (no address, school, phone, full name)."
   ].join("\n");
 }
 
-async function startCall(){
-  if(connected) return;
-  ring("ring");
-  setStatus("Connecting...");
-  el("connPill").innerText = "WebRTC: Connecting";
+function sendEvent(obj) {
+  if (!dc || dc.readyState !== "open") return false;
+  dc.send(JSON.stringify(obj));
+  return true;
+}
+
+function bindDataChannel(channel) {
+  if (!channel) return;
+
+  // avoid binding same label twice
+  if (boundChannelLabels.has(channel.label)) return;
+  boundChannelLabels.add(channel.label);
+
+  dc = channel;
+  console.log("Data channel bound:", dc.label);
+
+  dc.onopen = () => {
+    console.log("Data channel open:", dc.label);
+    setStatus("Connected");
+    setConnPill("WebRTC: Connected");
+    ring("connect");
+
+    // Update session settings (AUDIO ONLY)
+    sendEvent({
+      type: "session.update",
+      session: {
+        type: "realtime",
+        model: "gpt-realtime",
+        output_modalities: ["audio"],
+        audio: { output: { voice: "marin" } },
+        instructions: santaInstructions()
+      }
+    });
+
+    // Kickoff so Santa speaks
+    if (!didKickoff) {
+      didKickoff = true;
+
+      sendEvent({
+        type: "conversation.item.create",
+        item: {
+          type: "message",
+          role: "user",
+          content: [
+            { type: "input_text", text: "Hi Santa! Please greet me out loud, ask my first name, then ask how I’m feeling today." }
+          ]
+        }
+      });
+
+      sendEvent({
+        type: "response.create",
+        response: { modalities: ["audio"] }
+      });
+    }
+  };
+
+  dc.onmessage = (e) => {
+    let evt = null;
+    try { evt = JSON.parse(e.data); }
+    catch { console.log("Server event (raw):", e.data); return; }
+
+    // Helpful debug:
+    // console.log("Server event:", evt);
+
+    if (evt.type === "response.output_audio.started") {
+      console.log("Santa audio started");
+      setTalking(true);
+    }
+    if (evt.type === "response.output_audio.ended") {
+      console.log("Santa audio ended");
+      setTalking(false);
+    }
+
+    // Optional transcript if it arrives:
+    if (evt.type === "response.output_text.delta" && evt.delta) {
+      if (!window.__santaBubble) window.__santaBubble = pushBubble("santa", "");
+      window.__santaText = (window.__santaText || "") + evt.delta;
+      window.__santaBubble.innerText = window.__santaText;
+      const tag = document.createElement("div");
+      tag.className = "tag";
+      tag.innerText = "Santa";
+      window.__santaBubble.appendChild(tag);
+    }
+
+    if (evt.type === "error") {
+      console.log("Server error event:", evt);
+      setStatus("Error (see console)");
+      setConnPill("WebRTC: Error");
+    }
+  };
+
+  dc.onclose = () => console.log("Data channel closed:", dc.label);
+  dc.onerror = (err) => console.log("Data channel error:", err);
+}
+
+async function ensureAudioElement() {
+  remoteAudio = document.createElement("audio");
+  remoteAudio.autoplay = true;
+  remoteAudio.muted = false;
+  remoteAudio.volume = 1.0;
+  remoteAudio.playsInline = true;
+  document.body.appendChild(remoteAudio);
+}
+
+async function startCall() {
+  if (connected) return;
+
+  setStatus("Connecting…");
+  setConnPill("WebRTC: Connecting");
   el("hangupBtn").disabled = false;
   el("callBtn").disabled = true;
 
-  // Create peer connection
-  pc = new RTCPeerConnection();
-remoteAudio = document.createElement("audio");
-remoteAudio.autoplay = true;
-remoteAudio.muted = false;
-remoteAudio.playsInline = true;
-document.body.appendChild(remoteAudio);
+  didKickoff = false;
+  boundChannelLabels = new Set();
+  window.__santaBubble = null;
+  window.__santaText = "";
 
-pc.ontrack = async (e) => {
-  console.log("ontrack fired, streams:", e.streams);
-  remoteAudio.srcObject = e.streams[0];
   try {
-    await remoteAudio.play();
-    console.log("remoteAudio.play() OK");
-  } catch (err) {
-    console.log("remoteAudio.play() BLOCKED:", err);
-    // If blocked, click anywhere on the page once and it will usually allow playback.
-  }
-};
+    pc = new RTCPeerConnection();
 
+    // Remote audio playback
+    await ensureAudioElement();
 
-  // Mic
-  micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  micStream.getTracks().forEach(t => pc.addTrack(t, micStream));
+    pc.ontrack = async (e) => {
+      console.log("ontrack fired, streams:", e.streams);
+      remoteAudio.srcObject = e.streams[0];
 
-  // Data channel for events
-  // Handle server-created channel
-pc.ondatachannel = (event) => {
-  console.log("Got server datachannel:", event.channel.label);
-  bindDataChannel(event.channel);
-};
-
-// Also create a client channel (safe fallback)
-bindDataChannel(pc.createDataChannel("oai-events"));
-
-dc.onopen = () => {
-  console.log("Data channel open");
-
-  // 1) Send a user message so the model has something to respond to
-  dc.send(JSON.stringify({
-    type: "conversation.item.create",
-    item: {
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text: "Hi Santa! Ho ho ho! Can you say hello to me?" }]
-    }
-  }));
-
-  // 2) Ask the model to respond in AUDIO
-  dc.send(JSON.stringify({
-    type: "response.create",
-    response: {
-      modalities: ["audio"],
-      instructions:
-        "You are Santa on a real phone call with a child age 4–6. No emojis. Short, warm sentences. Start with a jolly greeting, ask their name, then ask how they feel."
-    }
-  }));
-};
-
-dc.addEventListener("message", (e) => {
-  try { console.log("Server event:", JSON.parse(e.data)); }
-  catch { console.log("Server event (raw):", e.data); }
-});
-
-
-    // Santa starts with a greeting immediately.
-    sendEvent({
-      type: "response.create",
-      response: {
-        instructions: "Start the call with a warm greeting and ask the child's first name. Then ask how they are feeling today."
+      try {
+        await remoteAudio.play();
+        console.log("remoteAudio.play() OK");
+      } catch (err) {
+        console.log("remoteAudio.play() BLOCKED:", err);
+        setStatus("Click once to enable audio");
+        const unlock = async () => {
+          try {
+            await remoteAudio.play();
+            console.log("Audio unlocked");
+            setStatus("Connected");
+          } catch (e2) {
+            console.log("Still blocked:", e2);
+          }
+        };
+        window.addEventListener("click", unlock, { once: true });
       }
-    });
-  };
+    };
 
-  dc.onmessage = (e)=>handleServerEvent(e.data);
-  dc.onclose = ()=>{
-    connected = false;
-    setStatus("Disconnected");
-    el("connPill").innerText = "WebRTC: Idle";
-    el("callBtn").disabled = false;
-  };
+    // Mic
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    micStream.getTracks().forEach((t) => pc.addTrack(t, micStream));
 
-  // Offer/Answer via our backend (unified interface)
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
+    // Data channel: support both server-created and client-created
+    pc.ondatachannel = (event) => {
+      console.log("Got server datachannel:", event.channel.label);
+      bindDataChannel(event.channel);
+    };
+    bindDataChannel(pc.createDataChannel("oai-events"));
 
- // 1) Ask server for ephemeral token
-const tokenResp = await fetch("/token");
-const tokenData = await tokenResp.json();
+    // SDP offer
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    ring("ring");
 
-if (!tokenResp.ok) {
-  throw new Error("Token error: " + JSON.stringify(tokenData));
-}
+    if (!USE_TOKEN) {
+      // Server-side exchange via /session
+      const sdpResp = await fetch("/session", {
+        method: "POST",
+        headers: { "Content-Type": "application/sdp" },
+        body: offer.sdp
+      });
 
-// Depending on API shape, this is commonly tokenData.client_secret.value
-const EPHEMERAL_KEY =
-  tokenData?.client_secret?.value ||
-  tokenData?.client_secret ||
-  tokenData?.ephemeral_key ||
-  tokenData?.value;
+      if (!sdpResp.ok) {
+        const errText = await sdpResp.text().catch(() => "");
+        console.log("SDP /session failed:", sdpResp.status, errText);
+        setStatus("Connect failed (server error)");
+        setConnPill("WebRTC: Error");
+        alert("Server error starting call:\n\n" + errText.slice(0, 800));
+        throw new Error("SDP /session failed");
+      }
 
-if (!EPHEMERAL_KEY) {
-  throw new Error("No ephemeral key in response: " + JSON.stringify(tokenData));
-}
+      const answerSdp = await sdpResp.text();
+      if (!answerSdp.trim().startsWith("v=")) {
+        console.log("Bad SDP received:", answerSdp.slice(0, 200));
+        setStatus("Connect failed (bad SDP)");
+        setConnPill("WebRTC: Error");
+        alert("Bad SDP received from server (expected SDP starting with v=).");
+        throw new Error("Bad SDP");
+      }
 
-// 2) Send SDP offer directly to OpenAI with ephemeral key
-const sdpResp = await fetch("https://api.openai.com/v1/realtime/calls", {
-  method: "POST",
-  headers: {
-    "Authorization": `Bearer ${EPHEMERAL_KEY}`,
-    "Content-Type": "application/sdp"
-  },
-  body: offer.sdp
-});
+      await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+    } else {
+      // Client-side exchange via /token (ephemeral)
+      const tokenResp = await fetch("/token");
+      const tokenData = await tokenResp.json().catch(() => ({}));
 
-const answerSdp = await sdpResp.text();
-await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
+      if (!tokenResp.ok) {
+        console.log("Token failed:", tokenResp.status, tokenData);
+        alert("Token failed:\n\n" + JSON.stringify(tokenData).slice(0, 800));
+        throw new Error("Token failed");
+      }
 
-}
+      const EPHEMERAL_KEY = tokenData?.value;
+      if (!EPHEMERAL_KEY) {
+        alert("Token response missing .value");
+        throw new Error("No token value");
+      }
 
-/** Parse server events for text deltas + lifecycle. */
-let santaBubble = null;
-let santaText = "";
-function handleServerEvent(raw){
-  let evt = null;
-  try{ evt = JSON.parse(raw); }catch{ return; }
+      const sdpResp = await fetch("https://api.openai.com/v1/realtime/calls", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${EPHEMERAL_KEY}`,
+          "Content-Type": "application/sdp"
+        },
+        body: offer.sdp
+      });
 
-  // Text streaming events
-  if(evt.type === "response.output_text.delta" && evt.delta){
-    if(!santaBubble){
-      santaText = "";
-      santaBubble = pushBubble("santa", "");
-      setTalking(true);
+      if (!sdpResp.ok) {
+        const errText = await sdpResp.text().catch(() => "");
+        console.log("Client SDP failed:", sdpResp.status, errText);
+        alert("Client SDP failed:\n\n" + errText.slice(0, 800));
+        throw new Error("Client SDP failed");
+      }
+
+      const answerSdp = await sdpResp.text();
+      if (!answerSdp.trim().startsWith("v=")) {
+        alert("Bad SDP from OpenAI");
+        throw new Error("Bad SDP (OpenAI)");
+      }
+
+      await pc.setRemoteDescription({ type: "answer", sdp: answerSdp });
     }
-    santaText += evt.delta;
-    santaBubble.innerText = santaText;
-    // Keep tag at bottom
-    const tag = document.createElement("div");
-    tag.className = "tag";
-    tag.innerText = "Santa";
-    santaBubble.appendChild(tag);
-  }
 
-if (evt.type === "response.output_audio.started") {
-  console.log("Santa audio started");
-  setTalking(true);
+    connected = true;
+    setStatus("Connected");
+    setConnPill("WebRTC: Connected");
+  } catch (err) {
+    console.log(err);
+    hangup();
+  }
 }
-if (evt.type === "response.output_audio.ended") {
-  console.log("Santa audio ended");
+
+function hangup() {
+  try { dc?.close(); } catch {}
+  try { pc?.close(); } catch {}
+  dc = null;
+  pc = null;
+
+  try { micStream?.getTracks()?.forEach(t => t.stop()); } catch {}
+  micStream = null;
+
+  try {
+    if (remoteAudio) {
+      remoteAudio.pause();
+      remoteAudio.srcObject = null;
+      remoteAudio.remove();
+    }
+  } catch {}
+  remoteAudio = null;
+
+  connected = false;
+  didKickoff = false;
   setTalking(false);
+
+  setStatus("Not connected");
+  setConnPill("WebRTC: Idle");
+
+  el("callBtn").disabled = false;
+  el("hangupBtn").disabled = true;
 }
 
-
-  if(evt.type === "response.completed"){
-    setTalking(false);
-    santaBubble = null;
-    santaText = "";
-  }
-
-  // Optional: show when user speech is detected
-  if(evt.type === "input_audio_buffer.speech_started"){
-    el("callStatus").innerText = ptt ? "Listening (PTT)..." : "Listening...";
-  }
-  if(evt.type === "input_audio_buffer.speech_stopped"){
-    el("callStatus").innerText = "Connected";
-  }
-}
-
-/** Send a user text message (fallback). */
-function sayTyped(){
+function sayTyped() {
   const t = el("typed").value.trim();
-  if(!t) return;
+  if (!t) return;
   el("typed").value = "";
   pushBubble("kid", t);
 
-  // Add to conversation as a user item and then request response
   sendEvent({
     type: "conversation.item.create",
     item: {
@@ -329,116 +385,56 @@ function sayTyped(){
       content: [{ type: "input_text", text: t }]
     }
   });
-  sendEvent({ type: "response.create" });
+
+  sendEvent({ type: "response.create", response: { modalities: ["audio"] } });
 }
 
-/** Switch modes by sending a short user message that Santa will follow. */
-function chooseMode(mode){
+function chooseMode(mode) {
   pushBubble("kid", mode.toUpperCase());
+
+  const prompt =
+    mode === "story"
+      ? "I choose STORY. Ask for hero, place, magic thing, and problem. Then tell the long story."
+      : "I choose GAME. Start Santa's Helper Mission for ages 4–6 with simple A/B choices.";
+
   sendEvent({
     type: "conversation.item.create",
     item: {
       type: "message",
       role: "user",
-      content: [{ type: "input_text", text: `I choose ${mode}.` }]
+      content: [{ type: "input_text", text: prompt }]
     }
   });
-  sendEvent({ type: "response.create" });
+
+  sendEvent({ type: "response.create", response: { modalities: ["audio"] } });
 }
 
-/** Camera preview (local only). */
-async function toggleCamera(){
-  const v = el("selfPreview");
-  const lbl = el("selfLabel");
-  if(selfStream){
-    selfStream.getTracks().forEach(t=>t.stop());
-    selfStream = null;
-    v.srcObject = null;
-    v.style.display = "none";
-    lbl.style.display = "none";
-    el("camBtn").innerText = "Camera Off";
-    return;
-  }
-  selfStream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 640 }, audio:false });
-  v.srcObject = selfStream;
-  v.style.display = "block";
-  lbl.style.display = "block";
-  el("camBtn").innerText = "Camera On";
-}
-
-/** Push-to-talk toggles VAD off and requires manual response.create. */
-function togglePTT(){
-  ptt = !ptt;
-  el("pttBtn").innerText = ptt ? "Push-to-Talk On" : "Push-to-Talk Off";
-  el("vadPill").innerText = "VAD: " + (ptt ? "Off" : "On");
-  if(connected){
-    sendEvent({
-      type: "session.update",
-      session: { audio: { input: { turn_detection: { type: ptt ? "none" : "semantic_vad" } } } }
-    });
-  }
-}
-
-/** “Hold to talk” behavior for PTT */
-function attachPTTHold(){
-  const btn = el("pttBtn");
-  let holding = false;
-
-  const start = ()=>{
-    if(!ptt || !connected || holding) return;
-    holding = true;
-    // In WebRTC, audio is always flowing. We just tell the model to respond when we release.
-    el("callStatus").innerText = "Talk now (release to send)";
-    ring("ring");
-  };
-  const end = ()=>{
-    if(!ptt || !connected || !holding) return;
-    holding = false;
-    el("callStatus").innerText = "Sending...";
-    sendEvent({ type:"response.create" });
-    setTimeout(()=> el("callStatus").innerText="Connected", 300);
-  };
-
-  btn.addEventListener("mousedown", start);
-  btn.addEventListener("mouseup", end);
-  btn.addEventListener("touchstart", (e)=>{ e.preventDefault(); start(); }, {passive:false});
-  btn.addEventListener("touchend", (e)=>{ e.preventDefault(); end(); }, {passive:false});
-}
-
-function resetUI(){
-  logEl.innerHTML = "";
-  setTalking(false);
-  setStatus("Not connected");
-  el("connPill").innerText = "WebRTC: Idle";
-  el("callBtn").disabled = false;
-  el("hangupBtn").disabled = true;
-}
-
-function hangup(){
-  try{ dc?.close(); }catch{}
-  try{ pc?.close(); }catch{}
-  dc = null; pc = null;
-  connected = false;
-  try{ micStream?.getTracks()?.forEach(t=>t.stop()); }catch{}
-  micStream = null;
-  setStatus("Not connected");
-  el("connPill").innerText = "WebRTC: Idle";
-  el("callBtn").disabled = false;
-  el("hangupBtn").disabled = true;
-  setTalking(false);
-}
-
-function bind(){
+function bindUI() {
   el("callBtn").addEventListener("click", startCall);
   el("hangupBtn").addEventListener("click", hangup);
+
   el("sayBtn").addEventListener("click", sayTyped);
-  el("storyBtn").addEventListener("click", ()=>chooseMode("story"));
-  el("gameBtn").addEventListener("click", ()=>chooseMode("game"));
-  el("camBtn").addEventListener("click", toggleCamera);
-  el("pttBtn").addEventListener("click", togglePTT);
-  el("resetBtn").addEventListener("click", ()=>{ resetUI(); if(connected){ sendEvent({type:"conversation.clear"}); sendEvent({type:"response.create", response:{instructions:"Restart the call. Greet and ask the child's first name and how they feel."}});} });
-  el("typed").addEventListener("keydown",(e)=>{ if(e.key==="Enter") sayTyped(); });
-  attachPTTHold();
+  el("typed").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") sayTyped();
+  });
+
+  el("storyBtn").addEventListener("click", () => chooseMode("story"));
+  el("gameBtn").addEventListener("click", () => chooseMode("game"));
+
+  const resetBtn = el("resetBtn");
+  if (resetBtn) resetBtn.addEventListener("click", () => { logEl.innerHTML = ""; window.__santaBubble = null; window.__santaText = ""; });
+
+  // Camera/PTT placeholders (kept simple for a working v2 audio call)
+  el("camBtn").addEventListener("click", () => alert("Camera preview not wired in this build (audio-only realtime)."));
+  el("pttBtn").addEventListener("click", () => alert("Push-to-talk not wired in this build (audio-only realtime)."));
+
+  setConnPill("WebRTC: Idle");
+  setStatus("Not connected");
+  setTalking(false);
+}
+
+bindUI();
+
   el("vadPill").innerText = "VAD: On";
 }
 bind();
