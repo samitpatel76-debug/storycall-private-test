@@ -50,7 +50,7 @@ app.get("/token", async (req, res) => {
       session: {
         type: "realtime",
         model: MODEL,
-        output_modalities: ["audio", "text"],
+        output_modalities: ["audio"],
         audio: { output: { voice: VOICE } }
       }
     };
@@ -103,7 +103,7 @@ app.post("/session", async (req, res) => {
     const session = {
       type: "realtime",
       model: MODEL,
-      output_modalities: ["audio", "text"],
+      output_modalities: ["audio"],
       audio: {
         output: { voice: VOICE }
       }
